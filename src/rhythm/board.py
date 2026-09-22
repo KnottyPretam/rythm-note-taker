@@ -20,8 +20,13 @@ SEEN = re.compile(r"^%%\s*rhythm-seen\s+(.*?)\s*%%\s*$")
 # Ids are recognised ONLY at end-of-line on a card. Scanning the whole file
 # would let a card whose prose happens to mention an id permanently suppress the
 # real task with that id.
-CARD = re.compile(r"^\s*- \[[ xX]\] .*\s\^(rk-[0-9a-f]{12})\s*$")
-OPEN_CARD = re.compile(r"^\s*- \[ \] (.*?)\s*\^rk-[0-9a-f]{12}\s*$")
+# ONE grammar for a card, so nothing can disagree about what is on the board:
+#   group 1 = checkbox state, group 2 = text, group 3 = id
+CARD = re.compile(r"^\s*- \[([ xX])\] (.*)\s\^(rk-[0-9a-f]{12})\s*$")
+
+# A card typed straight onto the board by hand, with no id. sync cannot track
+# it, but it is the user's text, so the renderer still shows it.
+BARE = re.compile(r"^\s*- \[([ xX])\] (.*?)\s*$")
 
 
 def read():
@@ -46,7 +51,7 @@ def read():
             cols.setdefault(line[3:].strip().lower(), i)
         m = CARD.match(line)
         if m:
-            on_board.add(m.group(1))
+            on_board.add(m.group(3))
 
     return lines, cols, on_board, seen
 
@@ -113,17 +118,67 @@ def sync(skip=None):
     return len(new)
 
 
+def _span(lines, head):
+    """The lines belonging to the column whose heading is at `head`."""
+    end = next((j for j in range(head + 1, len(lines))
+                if lines[j].startswith("## ")), len(lines))
+    return lines[head + 1:end]
+
+
+def _cards(lines, head):
+    """[(text, done, id)] for one column. A hand-written card with no id is
+    included with id None -- it is the user's text, even though sync cannot
+    track it."""
+    out = []
+    for line in _span(lines, head):
+        m = CARD.match(line)
+        if m:
+            out.append((m.group(2).strip(), m.group(1) != " ", m.group(3)))
+            continue
+        m = BARE.match(line)
+        if m and m.group(2):
+            out.append((m.group(2), m.group(1) != " ", None))
+    return out
+
+
 def route_tasks():
     """Unchecked cards under ## Route, ids and checkbox stripped."""
     lines, cols, _, _ = read()
     head = cols.get("route")
     if head is None:
         return []
-    end = next((j for j in range(head + 1, len(lines))
-                if lines[j].startswith("## ")), len(lines))
-    out = []
-    for line in lines[head + 1:end]:
-        m = OPEN_CARD.match(line)
-        if m:
-            out.append(m.group(1))
-    return out
+    return [t for t, done, _ in _cards(lines, head) if not done]
+
+
+def payload():
+    """What the nvim renderer draws. A PURE READ -- it must never call sync(),
+    or merely opening the view would rewrite the board and trip its own
+    directory watcher."""
+    lines, cols, _, _ = read()
+    columns = []
+    for slot, head in enumerate(sorted(cols.values())):
+        columns.append({
+            # Display case survives only on the heading line; `cols` is keyed
+            # lowercase.
+            "title": lines[head][3:].strip(),
+            # A categorical SLOT, not a colour. Lua owns the palette, so the
+            # radar can reuse this field for a different ramp.
+            "accent": slot,
+            "entries": [{"text": t, "meta": "", "dim": done, "id": tid or ""}
+                        for t, done, tid in _cards(lines, head)],
+        })
+    name = os.path.basename(BOARD).removesuffix(".md").removesuffix("_kanban")
+    return {"title": "BOARD \u00b7 " + name, "columns": columns}
+
+
+def remove(tid):
+    """Delete a card from the board. Its id stays in the seen-set, and that is
+    exactly what makes sync ignore the marker in the note from now on."""
+    lines, _, on_board, seen = read()
+    keep = [l for l in lines
+            if not (CARD.match(l) and CARD.match(l).group(3) == tid)]
+    if len(keep) == len(lines):
+        return False
+    # on_board was read BEFORE the removal, so it still holds tid.
+    write(keep, seen | on_board)
+    return True

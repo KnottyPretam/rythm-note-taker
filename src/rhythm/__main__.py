@@ -2,6 +2,8 @@
 
   rhythm new                      create today's next note, print its path
   rhythm sync [file:lnum]         fold markers from unsorted/ into the board
+  rhythm board                    the board as JSON, for the nvim renderer
+  rhythm remove <id>              drop a card, and ignore its marker from now on
   rhythm remind-route             one digest notification for the Route column
 """
 import subprocess
@@ -29,6 +31,19 @@ def main(argv):
             if path and lnum.isdigit():
                 skip = (path, int(lnum))
         board.sync(skip)
+
+    elif cmd == "board":
+        import json
+        import board
+        # Read only. Never sync from here.
+        json.dump(board.payload(), sys.stdout)
+
+    elif cmd == "remove":
+        import board
+        if not rest:
+            _usage()
+        if not board.remove(rest[0]):
+            return 1
 
     elif cmd == "remind-route":
         import board
