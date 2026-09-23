@@ -10,6 +10,7 @@
   rhythm radar-tick <pane> <t0>   record a focus event (the tmux hook only)
   rhythm radar-note <text...>     record an offline activity
   rhythm radar-forget <key>       drop an activity from the radar
+  rhythm notify-tick <mako-id>    record a notification (the mako hook only)
 """
 import subprocess
 import sys
@@ -76,6 +77,18 @@ def main(argv):
             return 0
         try:
             radar.tick(rest[0], int(rest[1]))
+        except Exception:
+            return 0
+
+    elif cmd == "notify-tick":
+        import radar
+        # Called from mako's on-notify hook on every matching notification.
+        # Silent on any failure, for the same reason radar-tick is: a hot path
+        # whose output goes nowhere must not raise.
+        if not rest:
+            return 0
+        try:
+            radar.notice_tick(rest[0])
         except Exception:
             return 0
 

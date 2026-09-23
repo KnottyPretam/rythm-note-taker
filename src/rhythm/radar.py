@@ -7,6 +7,7 @@ sys.exit at import time when neither vault variable is set. The log is machine
 state rather than notes, so it lives under XDG_STATE_HOME, not in the vault.
 """
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -25,7 +26,6 @@ FMT = ("#{session_id}\t#{session_name}\t#{window_id}\t#{window_name}"
        "\t#{pane_current_path}\t#{pane_title}\t#{pane_current_command}"
        "\t#{socket_path}\t#{pane_id}")
 
-DAYS = 7                     # how far back RECENT reaches
 CLAUDE = "✳"            # Claude Code's own pane-title sentinel
 RESTORE_GRACE = 15           # seconds; see tick()
 
@@ -46,15 +46,20 @@ SELECT key, label, target, ts FROM (
   FROM event WHERE ts >= ?)
 WHERE rn = 1 ORDER BY ts DESC"""
 
-# `key NOT IN (touched today)` is what makes RECENT mean "and NOT today":
-# without it an activity touched yesterday and again today lists in both lanes.
-RECENT_SQL = """
-SELECT key, label, target, ts FROM (
-  SELECT key, label, target, ts,
-         row_number() OVER (PARTITION BY key ORDER BY ts DESC, id DESC) rn
-  FROM event WHERE ts >= ? AND ts < ?)
-WHERE rn = 1 AND key NOT IN (SELECT key FROM event WHERE ts >= ?)
-ORDER BY ts DESC"""
+NOTICE_SQL = ("SELECT key, label, meta, ts FROM notice WHERE ts >= ?"
+              " ORDER BY ts DESC")
+
+# socket_path and the server's start_time are server-WIDE constants and every
+# focus row already carries them, so the log itself answers "where is tmux".
+# That matters: the nix wrapper leaves tmux out of runtimeInputs on purpose, and
+# a bare `tmux` with no TMUX_TMPDIR finds the DEAD socket at /tmp/tmux-1000.
+# A note's target is NULL, and `NULL <> ''` is NULL rather than true, so notes
+# drop out of this on their own.
+SERVER_SQL = ("SELECT target FROM event WHERE target <> ''"
+              " ORDER BY ts DESC, id DESC LIMIT 1")
+
+# "[gov-tiberius] in Lucas Pick, Ryan Morris" -> ("gov-tiberius", "Lucas ...")
+MAKO = re.compile(r"^\[([^\]]+)\]\s+(?:in|from)\s+(.+)$")
 
 
 def _open():
@@ -82,6 +87,14 @@ def _open():
                 "id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, key TEXT NOT NULL,"
                 " label TEXT NOT NULL, target TEXT)")
     con.execute("CREATE INDEX IF NOT EXISTS event_ts ON event(ts)")
+    # Notifications captured from mako as they arrive. Separate from `event`
+    # because it is a different question -- "what pinged me" rather than "what
+    # was I doing" -- and because the lane queries are unrelated. `key` is
+    # UNIQUE so a conversation that pings ten times is one card with the latest
+    # time, not ten cards.
+    con.execute("CREATE TABLE IF NOT EXISTS notice ("
+                "id INTEGER PRIMARY KEY, ts INTEGER NOT NULL,"
+                " key TEXT NOT NULL UNIQUE, label TEXT NOT NULL, meta TEXT)")
     return con
 
 
@@ -167,6 +180,33 @@ def forget(key):
     con = _open()
     con.execute("BEGIN IMMEDIATE")
     con.execute("DELETE FROM event WHERE key = ?", (key,))
+    con.execute("DELETE FROM notice WHERE key = ?", (key,))
+    con.execute("COMMIT")
+    con.close()
+
+
+def notice_tick(mako_id):
+    """Record a notification mako is showing. Called from its on-notify hook.
+
+    mako's own history is useless for this: it keeps five EXPIRED notifications,
+    in memory, with no timestamps. `exec` hands us only the id (there are no
+    format specifiers in an action), so the summary is read back out of
+    `makoctl list` while the notification is still on screen.
+    """
+    out = subprocess.run(["makoctl", "list"], capture_output=True, text=True).stdout
+    want = "Notification %s: " % mako_id
+    summary = next((l[len(want):].strip() for l in out.splitlines()
+                    if l.startswith(want)), "")
+    if not summary:
+        return
+    m = MAKO.match(summary)
+    where, label = (m.group(1), m.group(2)) if m else ("", summary)
+    con = _open()
+    con.execute("BEGIN IMMEDIATE")
+    # Keyed on the conversation, so ten pings from one thread stay one card.
+    con.execute("INSERT INTO notice(ts, key, label, meta) VALUES(?,?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET ts = excluded.ts",
+                (int(time.time()), "mako:" + label, label, where))
     con.execute("COMMIT")
     con.close()
 
@@ -209,24 +249,61 @@ def _entry(row, now):
             "id": key, "tint": "" if target else "note", "target": target or ""}
 
 
+def _server(con):
+    """(socket, server_start) for the live tmux server, from the log itself."""
+    row = con.execute(SERVER_SQL).fetchone()
+    if not row:
+        return None
+    sock, _, rest = row[0].partition("|")
+    return sock, rest.partition("|")[0]
+
+
+def _waiting(con, now):
+    """The Notifications lane: things that have not been got to.
+
+    Three sources, none of them polled -- each is a file its owning app already
+    maintains. A source that is missing or unreadable contributes nothing
+    rather than failing the lane.
+    """
+    import notify                      # lazy: the tmux hot path never needs it
+    server = _server(con)
+    out = []
+    for key, label, why, ts, pane in notify.claude_waiting():
+        # Only a pane we can actually reach gets a target. Enter on a target-less
+        # card says so rather than jumping somewhere wrong.
+        target = "%s|%s|%s" % (server[0], server[1], pane) if server and pane else ""
+        out.append({"text": label, "meta": _age(ts, now) if ts else why,
+                    "dim": False, "id": key, "tint": "claude", "target": target})
+    for key, label, why in notify.slack_unread():
+        out.append({"text": label, "meta": why, "dim": False,
+                    "id": key, "tint": "slack", "target": ""})
+    for key, label, meta, ts in con.execute(NOTICE_SQL, (now - 7 * 86400,)):
+        out.append({"text": label, "meta": _age(ts, now), "dim": False,
+                    "id": key, "tint": "slack", "target": ""})
+    return out
+
+
 def payload():
     """The SAME envelope the boards emit, so one renderer draws all three
-    views. A pure read of the log."""
+    views. A pure read."""
     now = int(time.time())
-    today, back = _midnight(), _midnight(DAYS)
+    today = _midnight()
     con = _open()
     head = con.execute(NOW_SQL).fetchall()
     touched = con.execute(TODAY_SQL, (today,)).fetchall()
-    recent = con.execute(RECENT_SQL, (back, today, today)).fetchall()
+    waiting = _waiting(con, now)
     con.close()
     # entry.id is the SELECTION key and must be unique across the WHOLE
     # payload: compose() borders every card whose id matches the selection,
     # with no column filter, so one activity in two lanes lights up twice.
-    # NOW therefore OWNS its activity and the other lanes drop it.
+    # NOW therefore OWNS its activity and Touched today drops it. The
+    # notifications lane is namespaced (claude:/slack:/mako:) so it cannot
+    # collide with a tmux key.
     top = head[0][0] if head else None
-    lanes = [("Now", 4, head),
-             ("Touched today", 5, [r for r in touched if r[0] != top]),
-             ("Recent", 6, [r for r in recent if r[0] != top])]
-    return {"title": "RADAR", "columns":
-            [{"title": t, "accent": a, "entries": [_entry(r, now) for r in rows]}
-             for t, a, rows in lanes]}
+    return {"title": "RADAR", "columns": [
+        {"title": "Now", "accent": 4,
+         "entries": [_entry(r, now) for r in head]},
+        {"title": "Touched today", "accent": 5,
+         "entries": [_entry(r, now) for r in touched if r[0] != top]},
+        {"title": "Notifications", "accent": 6, "entries": waiting},
+    ]}

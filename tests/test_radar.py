@@ -95,9 +95,18 @@ class Lanes(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._db = radar.DB
         radar.DB = os.path.join(self.tmp, "radar.db")
+        # The Notifications lane reads the real ~/.claude/sessions and Slack's
+        # own state file. Point both at nothing, or these assertions depend on
+        # whether the machine running them happens to have unread Slack.
+        import notify
+        self._srcs = (notify.SESSIONS, notify.SLACK_STATE)
+        notify.SESSIONS = os.path.join(self.tmp, "none", "*.json")
+        notify.SLACK_STATE = os.path.join(self.tmp, "none.json")
 
     def tearDown(self):
         radar.DB = self._db
+        import notify
+        notify.SESSIONS, notify.SLACK_STATE = self._srcs
 
     def add(self, key, label, ago_s, target="sock|1|%0"):
         con = radar._open()
@@ -112,7 +121,8 @@ class Lanes(unittest.TestCase):
                 for c in radar.payload()["columns"]}
 
     def test_empty_log_still_yields_three_lanes(self):
-        self.assertEqual(list(self.lanes()), ["Now", "Touched today", "Recent"])
+        self.assertEqual(list(self.lanes()),
+                         ["Now", "Touched today", "Notifications"])
 
     def test_now_owns_its_activity(self):
         # a duplicated id would border two cards at once, because compose()
@@ -140,14 +150,6 @@ class Lanes(unittest.TestCase):
         card = [e for c in radar.payload()["columns"] for e in c["entries"]
                 if e["id"] == "$0:@1"][0]
         self.assertEqual(card["text"], "new label")
-
-    def test_recent_excludes_anything_touched_today(self):
-        self.add("$0:@1", "both", 3 * 86400)
-        self.add("$0:@1", "both", 120)
-        self.add("$0:@2", "only old", 3 * 86400)
-        lanes = self.lanes()
-        self.assertNotIn("$0:@1", lanes["Recent"])
-        self.assertIn("$0:@2", lanes["Recent"])
 
     def test_a_note_has_no_target_and_is_tinted(self):
         radar.note("  Talked with John   about HIL timing ")
