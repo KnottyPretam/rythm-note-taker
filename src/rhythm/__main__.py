@@ -6,6 +6,10 @@
   rhythm migrate                  one-off: split the old mixed columns
   rhythm remove <id>              drop a card, and ignore its marker from now on
   rhythm remind-route             one digest notification for the Route column
+  rhythm radar                    the activity radar as JSON, for the renderer
+  rhythm radar-tick <pane> <t0>   record a focus event (the tmux hook only)
+  rhythm radar-note <text...>     record an offline activity
+  rhythm radar-forget <key>       drop an activity from the radar
 """
 import subprocess
 import sys
@@ -56,6 +60,34 @@ def main(argv):
             _usage()
         if not board.remove(rest[0]):
             return 1
+
+    elif cmd == "radar":
+        import json
+        import radar
+        json.dump(radar.payload(), sys.stdout)
+
+    elif cmd == "radar-tick":
+        import radar
+        # Called from a tmux hook on every pane focus. Anything that goes wrong
+        # here must stay silent: run-shell -b discards stdout, and a traceback
+        # on a hot path would be invisible noise. A dropped event is harmless --
+        # the next focus records the same activity.
+        if len(rest) < 2 or not rest[1].isdigit():
+            return 0
+        try:
+            radar.tick(rest[0], int(rest[1]))
+        except Exception:
+            return 0
+
+    elif cmd == "radar-note":
+        import radar
+        radar.note(" ".join(rest))
+
+    elif cmd == "radar-forget":
+        import radar
+        if not rest:
+            _usage()
+        radar.forget(rest[0])
 
     elif cmd == "remind-route":
         import board
