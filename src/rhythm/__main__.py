@@ -2,7 +2,8 @@
 
   rhythm new                      create today's next note, print its path
   rhythm sync [file:lnum]         fold markers from unsorted/ into the board
-  rhythm board                    the board as JSON, for the nvim renderer
+  rhythm board [activity|project] a board as JSON, for the nvim renderer
+  rhythm migrate                  one-off: split the old mixed columns
   rhythm remove <id>              drop a card, and ignore its marker from now on
   rhythm remind-route             one digest notification for the Route column
 """
@@ -35,8 +36,19 @@ def main(argv):
     elif cmd == "board":
         import json
         import board
+        view = rest[0] if rest else "activity"
+        if view not in ("activity", "project"):
+            _usage()
         # Read only. Never sync from here.
-        json.dump(board.payload(), sys.stdout)
+        json.dump(board.payload(view), sys.stdout)
+
+    elif cmd == "migrate":
+        import board
+        moved, backup = board.migrate()
+        if backup is None:
+            print("rhythm: nothing to migrate")
+        else:
+            print(f"rhythm: moved {moved} card(s); backup at {backup}")
 
     elif cmd == "remove":
         import board

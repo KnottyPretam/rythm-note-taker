@@ -4,24 +4,33 @@ import re
 import secrets
 from datetime import date
 
+import vocab
 from paths import UNSORTED, atomic_write
 
-# A marker claims a line for the kanban board.
+# A marker claims a line for the kanban board. It carries BOTH dimensions:
 #
-#   *> task              -> Unknown column
-#   *Route> task         -> the Route column
-#   - *Route> task       -> same, written inside a list bullet
+#   *> task                  -> Backlog, no project
+#   *Active> task            -> the Active column
+#   *Active/Sceptre> task    -> Active, project Sceptre
+#   */Sceptre> task          -> Backlog, project Sceptre
+#   - *Route/GNC> task       -> same, written inside a list bullet
+#
+# Either slot may be miscased or misspelled; vocab.classify corrects it, and
+# the corrected spelling is written back into the note when the id is stamped.
 #
 # Whitespace after '>' is REQUIRED: without it `*ptr->field = 3;` in a pasted
 # code snippet parses as column 'ptr-' / task 'field = 3;' and becomes a card.
+# Adding the '/' slot does not widen that hole -- a URL like
+# `*see https://x.com> foo` still fails, because ':' is in neither charset.
 # The text must start with a non-space, so `*Route>   ` captures nothing rather
 # than minting an invisible card nobody can identify.
 MARKER = re.compile(
-    r"^\s*(?:[-*+]\s+)?"                 # optional list bullet
-    r"\*([A-Za-z][\w -]*)?>"             # *>  or  *Column>
+    r"^(\s*(?:[-*+]\s+)?)"               # 1 indent and optional list bullet
+    r"\*([A-Za-z][\w -]*)?"              # 2 activity  (absent in `*>`)
+    r"(?:/([A-Za-z][\w -]*)?)?>"         # 3 project   (absent in `*Active>`)
     r"\s+"                               # required
-    r"(\S.*?)"                           # task text
-    r"(?:\s*\^(rk-[0-9a-f]{12}))?"       # id, once stamped
+    r"(\S.*?)"                           # 4 task text
+    r"(?:\s*\^(rk-[0-9a-f]{12}))?"       # 5 id, once stamped
     r"\s*$"
 )
 
@@ -53,8 +62,29 @@ def new_note_path():
         return path
 
 
+def _canonical(lead, activity, project, text, tid):
+    """Rewrite a marker with the corrected spelling of whatever the user typed.
+
+    The SHAPE is preserved, only spelling is fixed: `*scEptEr>` becomes
+    `*Sceptre>`, not `*Backlog/Sceptre>`. Rewriting a one-slot marker into the
+    two-slot form would be a bigger edit to someone's note than fixing a typo,
+    and the card is filed identically either way. A slot that resolves to
+    nothing is left exactly as typed."""
+    def fix(slot, names):
+        return (vocab.resolve(slot, names) or slot) if slot else slot
+
+    act = fix(activity, vocab.ACTIVITIES + vocab.PROJECTS) if activity else None
+    prj = fix(project, vocab.PROJECTS) if project else None
+
+    head = "*" + (act or "")
+    if project is not None:
+        head += "/" + (prj or "")
+    return f"{lead}{head}> {text} ^{tid}"
+
+
 def scan(skip=None):
-    """Read every note, stamp un-stamped markers, return [(id, column, text)].
+    """Read every note, stamp un-stamped markers, return
+    [(id, activity, project, text)].
 
     `skip` is (abspath, lnum) of the line under the cursor when sync was called
     from the editor. That line is left alone entirely -- neither stamped nor
@@ -86,12 +116,15 @@ def scan(skip=None):
             m = MARKER.match(line)
             if not m:
                 continue
-            col, text, tid = m.group(1), m.group(2), m.group(3)
+            lead, act, prj, text, tid = m.groups()
             if not tid:
+                # Stamping and spelling-correction are ONE write: a second pass
+                # over the file would be a second chance to lose it.
                 tid = mint()
-                lines[i] = line.rstrip() + " ^" + tid
+                lines[i] = _canonical(lead, act, prj, text, tid)
                 dirty = True
-            found.append((tid, (col or "unknown").strip().lower(), text))
+            activity, project = vocab.classify(act, prj)
+            found.append((tid, activity, project, text))
 
         if dirty:
             atomic_write(path, "\n".join(lines) + "\n")
