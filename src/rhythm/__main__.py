@@ -11,6 +11,11 @@
   rhythm radar-note <text...>     record an offline activity
   rhythm radar-forget <key>       drop an activity from the radar
   rhythm notify-tick <mako-id>    record a notification (the mako hook only)
+  rhythm prompt-sent              record a prompt (Claude's UserPromptSubmit)
+  rhythm prompt-done              mark it answered (Claude's Stop)
+  rhythm prompt-failed            mark it answered badly (Claude's StopFailure)
+  rhythm prompt-expand            mark a slash command (UserPromptExpansion)
+  rhythm focus-watch              log window focus (the rhythm-focus service)
 """
 import subprocess
 import sys
@@ -91,6 +96,42 @@ def main(argv):
             radar.notice_tick(rest[0])
         except Exception:
             return 0
+
+    elif cmd in ("prompt-sent", "prompt-done", "prompt-failed", "prompt-expand"):
+        import json
+        # Claude Code hooks: the payload is JSON on stdin. Two hard rules.
+        #
+        # Print NOTHING. A UserPromptSubmit hook's stdout is appended to the
+        # model's context as additional context, so a stray traceback would
+        # end up inside the prompt it was recording.
+        #
+        # Exit 0, ALWAYS. A non-zero Stop hook is fed back to Claude as a
+        # reason the turn may not end -- a bug in the radar would turn into
+        # the agent being unable to stop talking.
+        try:
+            h = json.load(sys.stdin)
+        except Exception:
+            return 0
+        if not isinstance(h, dict):
+            return 0
+        try:
+            import prompts
+            if cmd == "prompt-sent":
+                prompts.sent(h)
+            elif cmd == "prompt-expand":
+                prompts.expanded(h)
+            elif not h.get("stop_hook_active"):
+                # Set when a Stop hook already blocked this turn once. We never
+                # block, so this only guards against double-counting a retry.
+                prompts.done(h, ok=(cmd == "prompt-done"))
+        except Exception:
+            return 0
+
+    elif cmd == "focus-watch":
+        import focus
+        # Long-running, under systemd. It exits non-zero when the compositor
+        # goes away, which is exactly when it should be restarted.
+        focus.watch()
 
     elif cmd == "radar-note":
         import radar

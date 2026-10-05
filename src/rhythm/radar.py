@@ -11,7 +11,7 @@ import re
 import sqlite3
 import subprocess
 import time
-from datetime import date, timedelta
+from datetime import date
 
 DB = os.path.join(os.environ.get("XDG_STATE_HOME",
                                  os.path.expanduser("~/.local/state")),
@@ -33,13 +33,22 @@ RESTORE_GRACE = 15           # seconds; see tick()
 # name says nothing the folder does not say better.
 UNNAMED = {"bash", "zsh", "sh", "fish", "dash", "tmux"}
 
-NOW_SQL = "SELECT key, label, target, ts FROM event ORDER BY ts DESC, id DESC LIMIT 1"
+# Now and Touched today are ONE query split by age, and they show exactly the
+# same kinds of thing -- prompts, windows, panes, notes. The only difference
+# between the lanes is when.
+#
+# A rolling window rather than a calendar day: at 00:30 what you were doing at
+# 23:00 is still what you are doing, and a midnight boundary would empty the
+# radar mid-thought. 16 hours is a waking day, so what you touched this morning
+# is still there tonight and yesterday morning is not.
+NOW_WINDOW = 2 * 3600
+TODAY_WINDOW = 16 * 3600
 
 # row_number(), not `max(ts) ... GROUP BY key`: SQLite guarantees the bare
 # columns only when a query holds EXACTLY one min/max aggregate, and gives no
 # tie-break when two rows share the maximum -- which one-second resolution
 # makes ordinary. ORDER BY ts DESC, id DESC is deterministic.
-TODAY_SQL = """
+RECENT_SQL = """
 SELECT key, label, target, ts FROM (
   SELECT key, label, target, ts,
          row_number() OVER (PARTITION BY key ORDER BY ts DESC, id DESC) rn
@@ -55,8 +64,21 @@ NOTICE_SQL = ("SELECT key, label, meta, ts FROM notice WHERE ts >= ?"
 # a bare `tmux` with no TMUX_TMPDIR finds the DEAD socket at /tmp/tmux-1000.
 # A note's target is NULL, and `NULL <> ''` is NULL rather than true, so notes
 # drop out of this on their own.
-SERVER_SQL = ("SELECT target FROM event WHERE target <> ''"
+# `LIKE '/%'`, not `<> ''`: window-focus rows carry a `win|<address>` target,
+# which is not a tmux server at all. A tmux target always opens with the
+# absolute socket path. A note's target is NULL, and NULL LIKE anything is
+# NULL rather than true, so notes still drop out on their own.
+SERVER_SQL = ("SELECT target FROM event WHERE target LIKE '/%'"
               " ORDER BY ts DESC, id DESC LIMIT 1")
+
+# The newest window-focus row per label, for linking a tmux-less Claude
+# session to the terminal window whose title carries its name.
+WINDOWS_SQL = """
+SELECT label, target FROM (
+  SELECT key, label, target, row_number() OVER
+         (PARTITION BY key ORDER BY ts DESC, id DESC) rn
+  FROM event WHERE key LIKE 'win:%')
+WHERE rn = 1"""
 
 # "[gov-tiberius] in Lucas Pick, Ryan Morris" -> ("gov-tiberius", "Lucas ...")
 MAKO = re.compile(r"^\[([^\]]+)\]\s+(?:in|from)\s+(.+)$")
@@ -177,6 +199,16 @@ def forget(key):
     Nothing writes a note: key except SUPER+I, and that always allocates a
     fresh row, so a forgotten note is gone for good.
     """
+    if key.startswith("prompt:"):
+        # A prompt is not an event, so the deletes below would silently match
+        # nothing and `x` would appear to do nothing at all.
+        import prompts
+        con = prompts._open()
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM prompt WHERE pid = ?", (key[7:],))
+        con.execute("COMMIT")
+        con.close()
+        return
     con = _open()
     con.execute("BEGIN IMMEDIATE")
     con.execute("DELETE FROM event WHERE key = ?", (key,))
@@ -211,19 +243,6 @@ def notice_tick(mako_id):
     con.close()
 
 
-def _midnight(days_ago=0):
-    """Epoch seconds of 00:00 local, `days_ago` CALENDAR days back.
-
-    tm_isdst=-1 makes libc resolve the offset from /etc/localtime for THAT
-    date. Never midnight - N*86400 (wrong by an hour either side of a DST
-    change) and never .replace(hour=0) on an aware datetime (that snapshots
-    today's offset). TZ stays unset: on NixOS there is no /usr/share/zoneinfo,
-    so TZ=America/Phoenix silently means UTC.
-    """
-    d = date.today() - timedelta(days=days_ago)
-    return int(time.mktime((d.year, d.month, d.day, 0, 0, 0, 0, 0, -1)))
-
-
 def _age(ts, now):
     """Under an hour, elapsed minutes beat the calendar, so something touched
     at 23:50 and looked at at 00:10 reads "20 min ago" rather than "yesterday".
@@ -241,12 +260,66 @@ def _age(ts, now):
     return "yesterday" if days == 1 else "%d days ago" % days
 
 
+def _clip(text, n=72):
+    """A prompt is not a card title. compose() wraps `text` over as many lines
+    as it needs, so an unclipped paragraph would be a twenty-line card."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[:n - 1].rstrip() + "\u2026"
+
+
 def _entry(row, now):
     key, label, target, ts = row
+    target = target or ""
     # `tint` is the one cosmetic call here: a dim border says "nothing behind
     # this one", which is the only way Enter behaves differently.
+    tint = "win" if target.startswith("win|") else ("" if target else "note")
     return {"text": label, "meta": _age(ts, now), "dim": False,
-            "id": key, "tint": "" if target else "note", "target": target or ""}
+            "id": key, "tint": tint, "target": target}
+
+
+def _prompt_rows(server, now):
+    """(unviewed, sent within NOW_WINDOW, sent between the two windows).
+
+    The `prompt` table lives in the same database but is OWNED by prompts.py,
+    which creates it -- so this opens its own connection rather than teaching
+    _open() about a table the tmux hot path never touches. Called after
+    _open(), so `event` already exists for the unviewed query to join against.
+    """
+    import prompts                     # lazy: the tmux hot path never needs it
+    con = prompts._open()
+    try:
+        windows = con.execute(WINDOWS_SQL).fetchall()
+        un = prompts.unviewed(con, now)
+        td = prompts.sent_since(con, now - TODAY_WINDOW)
+    finally:
+        con.close()
+
+    def card(pid, text, agent, ts, win, tint):
+        # A prompt's window id joins the focus log, but jumping needs the live
+        # server, which only the focus log knows. A session with no tmux field
+        # falls back to the Hyprland window whose title carries its name --
+        # the same link the viewed check uses, so the two cannot disagree.
+        if win:
+            target = "%s|%s|%s" % (server[0], server[1], win) if server else ""
+        else:
+            target = next((t for lbl, t in windows if agent and agent in lbl), "")
+        return {"text": '"%s"' % _clip(text), "dim": False,
+                "meta": "%s \u00b7 %s" % (agent, _age(ts, now)),
+                "id": "prompt:" + pid, "tint": tint, "target": target}
+
+    unviewed = [card(pid, text, agent, ts, win, "claude")
+                for pid, text, agent, ts, win in un]
+    # Notifications OWNS an unviewed prompt and Touched today drops it, the
+    # same rule NOW already follows -- entry.id is the selection key, and one
+    # id in two lanes lights both up. Looking at the pane therefore MOVES the
+    # card from Notifications down into Touched today rather than deleting it.
+    hot = {r[0] for r in un}
+    edge = now - NOW_WINDOW
+    sent = [(ts, card(pid, text, agent, ts, win, ""))
+            for pid, text, agent, ts, win in td if pid not in hot]
+    return (unviewed,
+            [c for ts, c in sent if ts >= edge],
+            [c for ts, c in sent if ts < edge])
 
 
 def _server(con):
@@ -267,7 +340,8 @@ def _waiting(con, now):
     """
     import notify                      # lazy: the tmux hot path never needs it
     server = _server(con)
-    out = []
+    unviewed, fresh, older = _prompt_rows(server, now)
+    out = list(unviewed)
     for key, label, why, ts, pane in notify.claude_waiting():
         # Only a pane we can actually reach gets a target. Enter on a target-less
         # card says so rather than jumping somewhere wrong.
@@ -280,30 +354,41 @@ def _waiting(con, now):
     for key, label, meta, ts in con.execute(NOTICE_SQL, (now - 7 * 86400,)):
         out.append({"text": label, "meta": _age(ts, now), "dim": False,
                     "id": key, "tint": "slack", "target": ""})
-    return out
+    return out, fresh, older
+
+
+def _lane(rows, sent, now):
+    """One lane. What you ASKED comes first, then the windows the tmux hook
+    structurally cannot see -- the chat agents and the ssh terminal -- then
+    ordinary tmux windows and notes underneath.
+
+    Both lanes are built by this, so Now and Touched today can never disagree
+    about what counts as an activity or how it is ordered.
+    """
+    win = [_entry(r, now) for r in rows if r[0].startswith("win:")]
+    panes = [_entry(r, now) for r in rows if not r[0].startswith("win:")]
+    return sent + win + panes
 
 
 def payload():
     """The SAME envelope the boards emit, so one renderer draws all three
     views. A pure read."""
     now = int(time.time())
-    today = _midnight()
     con = _open()
-    head = con.execute(NOW_SQL).fetchall()
-    touched = con.execute(TODAY_SQL, (today,)).fetchall()
-    waiting = _waiting(con, now)
+    recent = con.execute(RECENT_SQL, (now - TODAY_WINDOW,)).fetchall()
+    waiting, fresh, older = _waiting(con, now)
     con.close()
-    # entry.id is the SELECTION key and must be unique across the WHOLE
-    # payload: compose() borders every card whose id matches the selection,
-    # with no column filter, so one activity in two lanes lights up twice.
-    # NOW therefore OWNS its activity and Touched today drops it. The
-    # notifications lane is namespaced (claude:/slack:/mako:) so it cannot
-    # collide with a tmux key.
-    top = head[0][0] if head else None
+    # One row per activity, at its LATEST touch -- so an activity falls in
+    # exactly one lane and entry.id stays unique across the whole payload,
+    # which compose() requires: it borders every card matching the selection,
+    # with no column filter, so one id in two lanes lights up twice. The
+    # notifications lane is namespaced (prompt:/claude:/slack:/mako:) so it
+    # cannot collide either.
+    edge = now - NOW_WINDOW
     return {"title": "RADAR", "columns": [
         {"title": "Now", "accent": 4,
-         "entries": [_entry(r, now) for r in head]},
+         "entries": _lane([r for r in recent if r[3] >= edge], fresh, now)},
         {"title": "Touched today", "accent": 5,
-         "entries": [_entry(r, now) for r in touched if r[0] != top]},
+         "entries": _lane([r for r in recent if r[3] < edge], older, now)},
         {"title": "Notifications", "accent": 6, "entries": waiting},
     ]}

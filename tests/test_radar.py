@@ -76,25 +76,16 @@ class Age(unittest.TestCase):
         self.assertEqual(radar._age(old, now), "4 days ago")
 
 
-class Midnight(unittest.TestCase):
-    def test_is_actually_midnight_local(self):
-        t = time.localtime(radar._midnight())
-        self.assertEqual((t.tm_hour, t.tm_min, t.tm_sec), (0, 0, 0))
-        self.assertEqual(date.fromtimestamp(radar._midnight()), date.today())
-
-    def test_counts_calendar_days_not_multiples_of_86400(self):
-        # the bug this guards: midnight - N*86400 is off by an hour either
-        # side of a DST change
-        for n in (1, 7, 30):
-            self.assertEqual(date.fromtimestamp(radar._midnight(n)),
-                             date.today() - timedelta(days=n))
-
-
 class Lanes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._db = radar.DB
-        radar.DB = os.path.join(self.tmp, "radar.db")
+        # prompts.py owns the `prompt` table and opens its OWN connection, so
+        # it has its own DB path -- stubbing radar.DB alone left the lane tests
+        # reading the REAL log, and real prompts appeared in the assertions.
+        import prompts
+        self.tmp_db = os.path.join(self.tmp, "radar.db")
+        self._db = (radar.DB, prompts.DB)
+        radar.DB = prompts.DB = self.tmp_db
         # The Notifications lane reads the real ~/.claude/sessions and Slack's
         # own state file. Point both at nothing, or these assertions depend on
         # whether the machine running them happens to have unread Slack.
@@ -104,8 +95,9 @@ class Lanes(unittest.TestCase):
         notify.SLACK_STATE = os.path.join(self.tmp, "none.json")
 
     def tearDown(self):
-        radar.DB = self._db
         import notify
+        import prompts
+        radar.DB, prompts.DB = self._db
         notify.SESSIONS, notify.SLACK_STATE = self._srcs
 
     def add(self, key, label, ago_s, target="sock|1|%0"):
@@ -124,15 +116,40 @@ class Lanes(unittest.TestCase):
         self.assertEqual(list(self.lanes()),
                          ["Now", "Touched today", "Notifications"])
 
-    def test_now_owns_its_activity(self):
+    def test_the_lanes_split_on_two_hours(self):
+        self.add("$0:@1", "an hour ago", 3600)
+        self.add("$0:@2", "a minute ago", 60)
+        self.add("$0:@3", "this morning", 5 * 3600)
+        lanes = self.lanes()
+        # Now is a WINDOW, not the single latest row: two things touched in the
+        # last two hours are both what you are working on.
+        self.assertEqual(lanes["Now"], ["$0:@2", "$0:@1"])
+        self.assertEqual(lanes["Touched today"], ["$0:@3"])
+
+    def test_an_activity_falls_in_exactly_one_lane(self):
         # a duplicated id would border two cards at once, because compose()
-        # matches the selection with no column filter
-        self.add("$0:@1", "one", 300)
-        self.add("$0:@2", "two", 60)
+        # matches the selection with no column filter. One row per activity at
+        # its LATEST touch is what makes that structural rather than a rule.
+        for ago in (60, 3600, 2 * 3600 - 1, 2 * 3600 + 1, 5 * 3600, 15 * 3600):
+            self.add("$0:@%d" % ago, "w", ago)
+        lanes = self.lanes()
+        both = set(lanes["Now"]) & set(lanes["Touched today"])
+        self.assertEqual(both, set())
+        self.assertEqual(len(lanes["Now"]), 3)
+        self.assertEqual(len(lanes["Touched today"]), 3)
+
+    def test_older_than_sixteen_hours_is_in_neither_lane(self):
+        self.add("$0:@1", "yesterday", 17 * 3600)
+        self.add("$0:@2", "now", 60)
         lanes = self.lanes()
         self.assertEqual(lanes["Now"], ["$0:@2"])
-        self.assertNotIn("$0:@2", lanes["Touched today"])
-        self.assertIn("$0:@1", lanes["Touched today"])
+        self.assertEqual(lanes["Touched today"], [])
+
+    def test_the_latest_touch_decides_the_lane(self):
+        # Touched this morning AND a minute ago: it is current, not history.
+        self.add("$0:@1", "w", 5 * 3600)
+        self.add("$0:@1", "w", 60)
+        self.assertEqual(self.lanes()["Now"], ["$0:@1"])
 
     def test_ids_are_unique_across_the_whole_payload(self):
         for i in range(4):
@@ -141,9 +158,9 @@ class Lanes(unittest.TestCase):
         ids = [e for lane in self.lanes().values() for e in lane]
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_touched_today_dedupes_to_the_latest(self):
-        self.add("$0:@1", "old label", 600)
-        self.add("$0:@1", "new label", 300)
+    def test_a_lane_dedupes_to_the_latest(self):
+        self.add("$0:@1", "old label", 4 * 3600)
+        self.add("$0:@1", "new label", 3 * 3600)
         self.add("$0:@2", "other", 60)
         lanes = self.lanes()
         self.assertEqual(lanes["Touched today"].count("$0:@1"), 1)
